@@ -5,17 +5,28 @@ from tempfile import NamedTemporaryFile
 import numpy as np
 import gmt
 from os import remove
+from shutil import copyfile
 
-def _is_gridded(lon, lat):
-	"""
-	This method checks whether the coordinates given by lon
-	and lat are already gridded.
-	"""
+
+def _mask_array(array, maskfun):
+	# Mask values:
+	if maskfun is not None:
+		try:
+			# Try fast indexing first:
+			array[maskfun(array)] = np.NaN
+		except:
+			# Iterate over elements:
+			for g in array:
+				if maskfun(g):
+					g = np.nan
+
+
+def _compatible_shape(lon, lat):
 	# Quick and dirty:
 	nontrivial_dim_lon = np.count_nonzero([x > 1 for x in lon.shape])
 	nontrivial_dim_lat = np.count_nonzero([x > 1 for x in lat.shape])
 	if nontrivial_dim_lon == 1 and nontrivial_dim_lat == 1:
-		return False
+		return True
 	elif nontrivial_dim_lon == 2 and nontrivial_dim_lat == 2:
 		# Some more checks would be suited.
 		if len(lon.shape) != len(lat.shape):
@@ -26,11 +37,171 @@ def _is_gridded(lon, lat):
 			sameshape = lon.shape == lat.shape
 		if sameshape:
 			return True
-	print("success!")
 	raise TypeError("Error: lon and lat are not compatible in shape!")
 	
 
+def _is_gridded(lon, lat, tolerance=1e-5):
+	"""
+	This method checks whether the coordinates given by lon
+	and lat are already gridded.
+	"""
+	
+	# Make sure that shape of both arrays is compatible:
+	if not _compatible_shape(lon, lat):
+		return False
+	
+	# Inference is hard if grid is small:
+	if lon.size < 9:
+		raise TypeError("Error: lon and lat arrays too small! Interpolate to "
+		                "larger grid!")
+	
+	lon_ = lon.copy().flatten()
+	lat_ = lat.copy().flatten()
+	lon_[lon_<lon_[0]] += 360.0
+	
+	# Test the grid itself.
+	# Find out which index varies faster:
+	LON = 0
+	LAT = 1
+	if lon_[0] != lon_[1]:
+		# Longitude varies faster:
+		if lat_[0] != lat_[1]:
+			# May still be a grid but tilted:
+			# TODO!
+			dlat_ = lat_[1] - lat_[0]
+			DLAT = np.round((lat_[1:] - lat_[:-1]) / dlat_).astype(int)
+			
+			return False
+		fast_index = LON
+		dl1 = lon_[1]-lon_[0]
+		dl2 = lon_[2]-lon_[1]
+		# We may just be at a wraparound.
+		if abs(dl1) < abs(dl2):
+			dlon = dl1
+		else:
+			dlon = dl2
+		print("Fast index: LON")
+		
+	elif lat_[0] != lat_[1]:
+		# Latitude varies faster:
+		fast_index = LAT
+		print("Fast index: LAT")
+		
+		# We assume that there is no wraparound in latitude. #TODO?
+		dlat = lat_[1] - lat_[0]
+	else:
+		raise ValueError("Error: Longitude and latitude do not form a grid!")
+	
+	
+	# Now make sure we're on a well-defined grid:
+	if fast_index == LON:
+		# Determine dimension of longitudes:
+		M=0
+		while M < lon_.size-1:
+			# Check if next longitude coordinate is where expected:
+			if abs((lon_[M+1] - lon_[M]) / dlon - 1) > 0.01:
+				break
+			M += 1
+		M += 1
+		# Determine dimension of latitudes:
+		N=int(lon_.size/M)
+		dlat = lat_[M] - lat_[0]
+	elif fast_index == LAT:
+		N=0
+		while N < lat_.size-1:
+			# Check if next latitude coordinate is expected:
+			if abs((lat_[N+1] - lat_[N]) / dlat - 1) > 0.01:
+				break
+			N += 1
+		N += 1
+		# Determine dimension of longitudes:
+		M=int(lat_.size/N)
+		dl1 = lon_[N]-lon_[0]
+		dl2 = lon_[2*N]-lon_[N]
+		# We may just be at a wraparound.
+		if abs(dl1) < abs(dl2):
+			dlon = dl1
+		else:
+			dlon = dl2
+	
+	# Check grid:
+	if fast_index == LON:
+		lon_t, lat_t = np.meshgrid(dlon*np.arange(M)+lon_[0],
+		                           dlat*np.arange(N)+lat_[0],
+		                           indexing='xy')
+	else:
+		lon_t, lat_t = np.meshgrid(dlon*np.arange(M)+lon_[0],
+		                           dlat*np.arange(N)+lat_[0],
+		                           indexing='ij')
+	
+	lon_t = lon_t.flatten()
+	lat_t = lat_t.flatten()
+	
+	diff_lon = np.max(np.abs(lon_t-lon_))
+	diff_lat = np.max(np.abs(lat_t-lat_))
+	diff = max(diff_lon,diff_lat)
+
+	
+	return diff < tolerance
+				
+
 class Grid:
+	"""
+	A class for the automatic conversion of numpy arrays to gmt grids.
+	
+	
+	::Class methods::
+	
+	Grid(lon, lat, val, rect, filename=None)
+	
+	   Create a grid instance.
+	
+	
+	Static methods:
+	
+	grid_if_needed(lon, lat, val, gridlon, gridlat, filename=None,
+	               interpolator='nearest', maskfun=None, verbosity=0)
+	
+	grid_data(lon, lat, val, gridlon, gridlat, rect, filename=None,
+	          interpolator='nearest', maskfun=None)
+	
+	__str__():
+	   Returns the path of a temporary .grd file which contains the grid.
+	   The path can be passed to gmt. Can be heavy on file operations the
+	   first time the .grd file is created.
+	
+	"""
+	
+	
+	@staticmethod
+	def grid_if_needed(lon, lat, val, gridlon, gridlat, rect,
+	                   filename=None, interpolator='nearest',
+	                   maskfun=None, verbosity=0, **kwargs):
+		# TODO : Remove this method? Better to have option regrid=True
+		#        or interpolate=True in constructor?
+		
+		# Check input data:
+		if not isinstance(gridlon,np.ndarray):
+			gridlon = np.array(gridlon)
+		if not isinstance(gridlat,np.ndarray):
+			gridlat = np.array(gridlat)
+	
+		# See whether we even have to grid lon and lat:
+		if _is_gridded(lon, lat):
+			gridlon = lon.copy()
+			gridlat = lat.copy()
+			grd = val.copy()
+			_mask_array(grd, maskfun)
+			if verbosity > 1:
+				print("No regrids!")
+			return Grid(lon, lat, grd, rect, filename=filename, _no_grid_check=True,
+			            **kwargs)
+		else:
+			if verbosity > 0:
+				print("Regridding...")
+			return Grid.grid_data(lon, lat, val, gridlon, gridlat, rect,
+				                  filename, interpolator, maskfun, **kwargs)
+	
 	
 	@staticmethod
 	def grid_data(lon, lat, val, gridlon, gridlat, rect, filename=None,
@@ -46,22 +217,22 @@ class Grid:
 		# gridded shape:
 		if not _is_gridded(gridlon, gridlat):
 			gridlon, gridlat = np.meshgrid(gridlon, gridlat,
-			                               indexing='ij')
+				                           indexing='ij')
 		
 		# Grid the data.
 		# Use linear interpolation in 3D. Should be close enough to
 		# real spherical interpolation at short distances.
 		D2R = np.pi/180.0
 		vec_dat =  np.array([
-		              np.cos(D2R*lon)*np.cos(D2R*lat),
-		              np.sin(D2R*lon)*np.cos(D2R*lat),
-		              np.sin(D2R*lat)
-		           ]).T
+			          np.cos(D2R*lon)*np.cos(D2R*lat),
+			          np.sin(D2R*lon)*np.cos(D2R*lat),
+			          np.sin(D2R*lat)
+			       ]).T
 		vec_grid = np.array([
-		              np.cos(D2R*gridlon)*np.cos(D2R*gridlat),
-		              np.sin(D2R*gridlon)*np.cos(D2R*gridlat),
-		              np.sin(D2R*gridlat)
-		           ]).T
+			          np.cos(D2R*gridlon)*np.cos(D2R*gridlat),
+			          np.sin(D2R*gridlon)*np.cos(D2R*gridlat),
+			          np.sin(D2R*gridlat)
+			       ]).T
 		if interpolator == 'nearest':
 			interpolator = NearestNDInterpolator(vec_dat, val)
 		elif interpolator == 'linear':
@@ -73,20 +244,15 @@ class Grid:
 		grd = interpolator(vec_grid)
 		
 		# Mask values:
-		if maskfun is not None:
-			try:
-				# Try fast indexing first:
-				grd[maskfun(grd)] = np.NaN
-			except:
-				# Iterate over elements:
-				for g in grd:
-					if maskfun(g):
-						g = np.nan
+		_mask_array(grd, maskfun)
+		
 		
 		# Return grid:
-		return Grid(gridlon, gridlat, grd, rect, filename=filename, **kwargs)
+		return Grid(gridlon, gridlat, grd, rect, filename=filename, 
+		            _no_grid_check=True, **kwargs)
 	
-	def __init__(self, lon, lat, val, rect, filename=None):
+	def __init__(self, lon, lat, val, rect, filename=None,
+	             _no_grid_check=False):
 		"""
 		Parameters:
 		
@@ -106,7 +272,7 @@ class Grid:
 		self._remove_file = False
 		self._has_grid = False
 		self._rect = rect
-		if not _is_gridded(lon, lat) and \
+		if not _no_grid_check and not _is_gridded(lon, lat) and \
 		   not (np.issorted(lon) and np.issorted(lat)):
 		   # Q&D
 		   raise ValueError("For non-gridded data, lon and lat "
@@ -123,8 +289,8 @@ class Grid:
 		if not _is_gridded(self._lon, self._lat):
 			lon, lat = np.meshgrid(self._lon, self._lat,
 			                       indexing='ij')
-			dlon = lon[1]-lon[0]
-			dlat = lat[1]-lat[0]
+			dlon = self._lon[1]-self._lon[0]
+			dlat = self._lat[1]-self._lat[0]
 		else:
 			lon, lat = self._lon, self._lat
 			lon_unq = np.sort(np.unique(lon))
@@ -161,7 +327,8 @@ class Grid:
 				
 				
 				# Create the argument string:
-				args = "%s -G%s -ZBL -I%.5f/%.5f -V -R" \
+				# -F : Pixel registration.
+				args = "%s -G%s -ZBL -I%.5f/%.5f -V -F -R" \
 					   % (fcsv.name, self._filename, dlon, dlat) \
 					   +str(self._rect)
 				if nanvalue is not None:
