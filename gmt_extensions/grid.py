@@ -7,8 +7,14 @@ import gmt
 from os import remove
 from shutil import copyfile
 
+def same_shape(array1, array2):
+	return np.array_equal(array1.shape, array2.shape)
 
 def _mask_array(array, maskfun):
+	"""
+	Masks values of array where maskfun(array)==True.
+	This is done by setting array[maskfun(array)] = NaN
+	"""
 	# Mask values:
 	if maskfun is not None:
 		try:
@@ -61,8 +67,8 @@ def _is_gridded(lon, lat, tolerance=1e-5):
 	
 	# Test the grid itself.
 	# Find out which index varies faster:
-	LON = 0
-	LAT = 1
+	grid_property = dict()
+	grid_property["fast_index"] = -1
 	if lon_[0] != lon_[1]:
 		# Longitude varies faster:
 		if lat_[0] != lat_[1]:
@@ -71,8 +77,9 @@ def _is_gridded(lon, lat, tolerance=1e-5):
 			dlat_ = lat_[1] - lat_[0]
 			DLAT = np.round((lat_[1:] - lat_[:-1]) / dlat_).astype(int)
 			
-			return False
-		fast_index = LON
+			grid_property["is_gridded"] = False
+			return grid_property
+		grid_property["fast_index"] = "LON"
 		dl1 = lon_[1]-lon_[0]
 		dl2 = lon_[2]-lon_[1]
 		# We may just be at a wraparound.
@@ -80,12 +87,10 @@ def _is_gridded(lon, lat, tolerance=1e-5):
 			dlon = dl1
 		else:
 			dlon = dl2
-		print("Fast index: LON")
 		
 	elif lat_[0] != lat_[1]:
 		# Latitude varies faster:
-		fast_index = LAT
-		print("Fast index: LAT")
+		grid_property["fast_index"] = "LAT"
 		
 		# We assume that there is no wraparound in latitude. #TODO?
 		dlat = lat_[1] - lat_[0]
@@ -94,7 +99,7 @@ def _is_gridded(lon, lat, tolerance=1e-5):
 	
 	
 	# Now make sure we're on a well-defined grid:
-	if fast_index == LON:
+	if grid_property["fast_index"] == "LON":
 		# Determine dimension of longitudes:
 		M=0
 		while M < lon_.size-1:
@@ -106,7 +111,7 @@ def _is_gridded(lon, lat, tolerance=1e-5):
 		# Determine dimension of latitudes:
 		N=int(lon_.size/M)
 		dlat = lat_[M] - lat_[0]
-	elif fast_index == LAT:
+	elif grid_property["fast_index"] == "LAT":
 		N=0
 		while N < lat_.size-1:
 			# Check if next latitude coordinate is expected:
@@ -124,8 +129,11 @@ def _is_gridded(lon, lat, tolerance=1e-5):
 		else:
 			dlon = dl2
 	
+	grid_property["Nlon"] = M
+	grid_property["Nlat"] = N
+	
 	# Check grid:
-	if fast_index == LON:
+	if grid_property["fast_index"] == "LON":
 		lon_t, lat_t = np.meshgrid(dlon*np.arange(M)+lon_[0],
 		                           dlat*np.arange(N)+lat_[0],
 		                           indexing='xy')
@@ -140,9 +148,9 @@ def _is_gridded(lon, lat, tolerance=1e-5):
 	diff_lon = np.max(np.abs(lon_t-lon_))
 	diff_lat = np.max(np.abs(lat_t-lat_))
 	diff = max(diff_lon,diff_lat)
-
 	
-	return diff < tolerance
+	grid_property["is_gridded"] = diff < tolerance
+	return grid_property
 				
 
 class Grid:
@@ -176,7 +184,8 @@ class Grid:
 	@staticmethod
 	def grid_if_needed(lon, lat, val, gridlon, gridlat, rect,
 	                   filename=None, interpolator='nearest',
-	                   maskfun=None, verbosity=0, **kwargs):
+	                   maskfun=None, verbosity=0,
+	                   **kwargs):
 		# TODO : Remove this method? Better to have option regrid=True
 		#        or interpolate=True in constructor?
 		
@@ -187,15 +196,20 @@ class Grid:
 			gridlat = np.array(gridlat)
 	
 		# See whether we even have to grid lon and lat:
-		if _is_gridded(lon, lat):
+		grid_property = _is_gridded(lon,lat)
+		if grid_property["is_gridded"]:
 			gridlon = lon.copy()
 			gridlat = lat.copy()
 			grd = val.copy()
 			_mask_array(grd, maskfun)
+#			if not np.any(np.isnan(grd)):
+#				print("MASK DID NOT CHANGE ANYTHING!")
+#				print("should change:",np.count_nonzero(~maskfun(grd)))
 			if verbosity > 1:
 				print("No regrids!")
 			return Grid(lon, lat, grd, rect, filename=filename, _no_grid_check=True,
-			            **kwargs)
+			            fast_index=grid_property["fast_index"],
+			            Nlon=grid_property["Nlon"], Nlat=grid_property["Nlat"], **kwargs)
 		else:
 			if verbosity > 0:
 				print("Regridding...")
@@ -205,7 +219,8 @@ class Grid:
 	
 	@staticmethod
 	def grid_data(lon, lat, val, gridlon, gridlat, rect, filename=None,
-	              interpolator='nearest', maskfun=None, **kwargs):
+	              interpolator='nearest', maskfun=None,
+	              **kwargs):
 		
 		# Check input data:
 		if not isinstance(gridlon,np.ndarray):
@@ -215,7 +230,8 @@ class Grid:
 		
 		# Create grid, if gridlon and gridlat are not yet in
 		# gridded shape:
-		if not _is_gridded(gridlon, gridlat):
+		grid_property = _is_gridded(gridlon, gridlat)
+		if not grid_property["is_gridded"]:
 			gridlon, gridlat = np.meshgrid(gridlon, gridlat,
 				                           indexing='ij')
 		
@@ -248,11 +264,13 @@ class Grid:
 		
 		
 		# Return grid:
-		return Grid(gridlon, gridlat, grd, rect, filename=filename, 
-		            _no_grid_check=True, **kwargs)
+		return Grid(gridlon, gridlat, grd, rect, filename=filename,
+		            registration=registration, _no_grid_check=True,
+		            fast_index=grid_property["fast_index"],
+		            Nlon=grid_property["Nlon"], Nlat=grid_property["Nlat"], **kwargs)
 	
-	def __init__(self, lon, lat, val, rect, filename=None,
-	             _no_grid_check=False):
+	def __init__(self, lon, lat, val, rect, filename=None, registration='gridline',
+	             fast_index=None, Nlon=None, Nlat=None, _no_grid_check=False):
 		"""
 		Parameters:
 		
@@ -265,6 +283,16 @@ class Grid:
 		- filename (default: None)
 		  (Persistent) Cache file name
 		"""
+		# TODO: It would be best to only store lon, lat, and val in np.ndarrays.
+		#       Do conversion in the creation routines. This reduces code base
+		#       size and makes error-free code easier to write.
+		if not isinstance(lon,np.ndarray) or not isinstance(lat,np.ndarray) \
+		    or not isinstance(val,np.ndarray):
+			raise TypeError("Error: lon, lat, and val have to be given as "
+			                "numpy arrays!")
+		if not same_shape(lon, lat) or not same_shape(lon,val):
+			raise TypeError("Error: lon, lat, and val have to be given in "
+			                "same shape!")
 		self._lon = lon
 		self._lat = lat
 		self._val = val
@@ -272,11 +300,26 @@ class Grid:
 		self._remove_file = False
 		self._has_grid = False
 		self._rect = rect
-		if not _no_grid_check and not _is_gridded(lon, lat) and \
-		   not (np.issorted(lon) and np.issorted(lat)):
-		   # Q&D
-		   raise ValueError("For non-gridded data, lon and lat "
-		                    "have to be sorted!")
+		self._registration = registration
+		if registration not in ['gridline','pixel']:
+			raise ValueError("Unknown registration '" + str(registration) + "'. "
+			                 "Must be either 'gridline' or 'pixel'.")
+		if not _no_grid_check or fast_index is None or Nlon is None or \
+		    Nlat is None:
+		   grid_property = _is_gridded(lon, lat)
+		   fast_index = grid_property["fast_index"]
+		   Nlon = grid_property["Nlon"]
+		   Nlat = grid_property["Nlat"]
+		   if not grid_property["is_gridded"] and \
+		       not (np.issorted(lon) and np.issorted(lat)):
+		       # Q&D
+		       raise ValueError("For non-gridded data, lon and lat "
+		                        "have to be sorted!")
+		
+		
+		self._fast_index = fast_index
+		self._Nlon = Nlon
+		self._Nlat = Nlat
 	
 	def __del__(self):
 		if hasattr(self,'_remove_file') and self._remove_file:
@@ -286,7 +329,7 @@ class Grid:
 	def _create_grd_file(self):
 		
 		# Step 1: Create temporary csv:
-		if not _is_gridded(self._lon, self._lat):
+		if not _is_gridded(self._lon, self._lat)["is_gridded"]:
 			lon, lat = np.meshgrid(self._lon, self._lat,
 			                       indexing='ij')
 			dlon = self._lon[1]-self._lon[0]
@@ -303,13 +346,17 @@ class Grid:
 			# Create temporary CSV:
 			nanvalue = None
 			with NamedTemporaryFile(mode='w',suffix='.csv', delete=False) as fcsv:
+				if self._fast_index == 'LAT':
+					if np.count_nonzero([x > 1 for x in self._val.shape]) == 1:
+						val = self._val.reshape((self._Nlon,self._Nlat)).T.flatten()
+					else:
+						val = self._val.flatten()
+				else:
+					val = self._val.flatten()
 				if np.any(np.isnan(self._val)):
 					# Handle NaN:
 					nanvalue = int(np.floor(self._val[~np.isnan(self._val)].min()-1))
-					val = self._val.flatten()
 					val[np.isnan(val)] = nanvalue
-				else:
-					val = self._val.flatten()
 				csv_path = fcsv.name
 				np.savetxt(fcsv, val, delimiter=",")
 			
@@ -328,14 +375,17 @@ class Grid:
 				
 				# Create the argument string:
 				# -F : Pixel registration.
-				args = "%s -G%s -ZBL -I%.5f/%.5f -V -F -R" \
+				args = "%s -G%s -ZBL -I%.5f/%.5f -V -R" \
 					   % (fcsv.name, self._filename, dlon, dlat) \
 					   +str(self._rect)
 				if nanvalue is not None:
 					# Write NaN values to a value outside range:
 					args += " -di%i" % (nanvalue)
+				if self._registration is 'pixel':
+					# Pixel registration:
+					args += " -r "
 				
-				
+				print("args: '",args,"'")
 				lib.call_module('xyz2grd',args)
 			
 				# Should probably do a check beforehand:

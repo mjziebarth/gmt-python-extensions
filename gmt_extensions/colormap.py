@@ -120,7 +120,7 @@ class MPLWrapperColormap(Colormap):
 							x1 = segs[k][id_+1,0][0]
 							v1 = segs[k][id_+1,1][0]
 							c0[k] = (x-x0)/(x1-x0)*v0 + (x1-x)/(x1-x0)*v1
-							c1[k] = c[k]
+							c1[k] = c0[k]
 				colors += [[x,c0[0],c0[1],c0[2]]]
 				if c0[0] != c1[0] or c0[0] != c1[0] or c0[0] != c1[0]:
 					colors += [[x,c1[0],c1[1],c1[2]]]
