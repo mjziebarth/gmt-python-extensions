@@ -6,6 +6,7 @@ import numpy as np
 import gmt
 from os import remove
 from shutil import copyfile
+from math import gcd
 
 def same_shape(array1, array2):
 	return np.array_equal(array1.shape, array2.shape)
@@ -131,6 +132,10 @@ def _is_gridded(lon, lat, tolerance=1e-5):
 	
 	grid_property["Nlon"] = M
 	grid_property["Nlat"] = N
+	grid_property["dlon"] = dlon
+	grid_property["dlat"] = dlat
+	grid_property["lon0"] = lon_[0]
+	grid_property["lat0"] = lat_[0]
 	
 	# Check grid:
 	if grid_property["fast_index"] == "LON":
@@ -151,7 +156,129 @@ def _is_gridded(lon, lat, tolerance=1e-5):
 	
 	grid_property["is_gridded"] = diff < tolerance
 	return grid_property
-				
+
+
+
+#######################################################################
+
+def _unify_to_common_grid(grid0, grid1):
+	# TODO ...
+	raise Exception("Untested method called.")
+
+	# We need to create a grid that is tiled so that each tile border of one of the
+	# grids coincides with a tile border in the merged grid.
+	# Thus, the resulting grid
+	if not np.array_equal(grid0.rect(),grid1.rect()):
+		print("grid0:",grid0.rect())
+		print("grid1:",grid1.rect())
+		raise ValueError("Grids do not sample same region.")
+	rect = grid0.rect()
+	lon_min = rect[0]
+	lon_max = rect[1]
+	lat_min = rect[2]
+	lat_max = rect[3]
+
+	# Number of grid entries of the merged grid:
+	# N: number of longitude cells
+	# M: number of latitude cells
+	N0 = grid0._Nlon
+	N1 = grid1._Nlon
+	gcd_lon = gcd(N0,N1)
+	Nm = N0 * N1 / gcd_lon**2
+	M0 = grid0._Nlat
+	M1 = grid1._Nlat
+	gcd_lat = gcd(M0,M1)
+	Mm = M0 * M1 / gcd_lat**2
+	print("types:")
+	print("N0:",type(N0))
+	print("N1:",type(N1))
+	print("Nm:",type(Nm))
+	print("M0:",type(M0))
+	print("M1:",type(M1))
+	print("N0:",type(Mm))
+
+	# Grid definition:
+	dlon = (lon_max - lon_min) / Nm
+	dlat = (lat_max - lat_min) / Mm
+	lon0 = lon_min + 0.5*dlon
+	lat0 = lat_min + 0.5*dlat
+	val0 = np.zeros((Mm,Nm))
+	val1 = np.zeros((Mm,Nm))
+
+	# Values at merged grid:
+	step_lon0 = N0 / gcd_lon
+	step_lat0 = M0 / gcd_lat
+	id0_lat,id0_lon = np.meshgrid(((np.arange(Mm)/step_lat0).astype(int),
+		                           (np.arange(Nm)/step_lon0).astype(int)))
+	print("id0_lat[0:5]:",id0_lat.flat[0:5])
+	print("id0_lon[0:5]:",id0_lon.flat[0:5])
+	val0 = grid0[id0_lon,id0_lat]
+	val1 = grid1[id1_lon,id1_lat]
+
+	# Return grids:
+	newgrid0 = Grid(None, None, val0, rect, fast_index='LON', Nlon=Nm, Nlat=Mm,
+		            lon0=lon0, lat0=lat0, dlon=dlon, dlat=dlat,
+		            _no_grid_check=True)
+	newgrid1 = Grid(None, None, val1, rect, fast_index='LON', Nlon=Nm, Nlat=Mm,
+		            lon0=lon0, lat0=lat0, dlon=dlon, dlat=dlat,
+		            _no_grid_check=True)
+	return newgrid0, newgrid1
+
+
+def _unify_to_target_grid(src, dest, out_of_range_policy='nan'):
+	
+	# Obtain indices of target grid coordinates in
+	# source grid (Target In Source):
+	dest_lon = dest._lon0 + dest._dlon * np.arange(dest._Nlon)
+	dest_lat = dest._lat0 + dest._dlat * np.arange(dest._Nlat)
+	TIC_i, TIC_j = np.meshgrid(np.round((dest_lat-src._lat0) / src._dlat).astype(int),
+	                           np.round((dest_lon-src._lon0) / src._dlon).astype(int),
+	                           indexing='ij')
+	
+	# Make sure that we can assign values to any grid point of the destination
+	# grid:
+	nan_mask = np.logical_or(np.logical_or(TIC_i < 0, TIC_i >= src._Nlat),
+	                         np.logical_or(TIC_j < 0, TIC_j >= src._Nlon))
+	if np.any(nan_mask):
+		if out_of_range_policy == 'exception':
+			raise ValueError('Destination grid bigger than source grid, cannot '
+			                 'assign values!')
+		elif out_of_range_policy == 'nan':
+			TIC_i[nan_mask] = 0
+			TIC_j[nan_mask] = 0
+			src2dest_vals = src._2dview[TIC_i,TIC_j]
+			src2dest_vals[nan_mask] = np.NaN
+	else:
+		src2dest_vals = src._2dview[TIC_i,TIC_j]
+	
+	return Grid(None, None, src2dest_vals, dest._rect, fast_index='LON',
+	            Nlon=dest._Nlon, Nlat=dest._Nlat, lon0=dest._lon0, lat0=dest._lat0,
+	            dlon=dest._dlon, dlat=dest._dlat, _no_grid_check=True)
+
+
+def unified_grids(grid0,grid1,tolerance=None, algorithm='common'):
+	"""
+	Unify two grids to a common grid.
+	
+	Algorithms:
+	 - 'common': Create a common grid that contains both grids as subset.
+	             So far only works if the regions of both grids are equal.
+	 - '0->1'  : Interpolate grid0 to grid1 coordinates
+	 - '1->0'  : Interpolate grid1 to grid0 coordinates
+	 - 'auto'  : Choose common grid if regions are equal, otherwise use
+	             interpolation to finer grid (TODO!)
+	"""
+	
+	if algorithm == 'common':
+		return _unify_to_common_grid(grid0,grid1)
+	elif algorithm == '0->1' or algorithm == '1->0':
+		if algorithm == '0->1':
+			return _unify_to_target_grid(grid0,grid1), grid1
+		else:
+			return grid0, _unify_to_target_grid(grid1,grid0)
+
+
+###############################################################################
 
 class Grid:
 	"""
@@ -264,13 +391,13 @@ class Grid:
 		
 		
 		# Return grid:
-		return Grid(gridlon, gridlat, grd, rect, filename=filename,
-		            registration=registration, _no_grid_check=True,
+		return Grid(gridlon, gridlat, grd, rect, filename=filename, _no_grid_check=True,
 		            fast_index=grid_property["fast_index"],
 		            Nlon=grid_property["Nlon"], Nlat=grid_property["Nlat"], **kwargs)
 	
 	def __init__(self, lon, lat, val, rect, filename=None, registration='gridline',
-	             fast_index=None, Nlon=None, Nlat=None, _no_grid_check=False):
+	             fast_index=None, Nlon=None, Nlat=None, lon0=None, lat0=None, dlon=None,
+	             dlat=None, _no_grid_check=False):
 		"""
 		Parameters:
 		
@@ -286,60 +413,103 @@ class Grid:
 		# TODO: It would be best to only store lon, lat, and val in np.ndarrays.
 		#       Do conversion in the creation routines. This reduces code base
 		#       size and makes error-free code easier to write.
-		if not isinstance(lon,np.ndarray) or not isinstance(lat,np.ndarray) \
-		    or not isinstance(val,np.ndarray):
-			raise TypeError("Error: lon, lat, and val have to be given as "
-			                "numpy arrays!")
-		if not same_shape(lon, lat) or not same_shape(lon,val):
+		required_keywords = [fast_index,Nlon,Nlat,lon0,lat0,dlon,dlat]
+		if not isinstance(val,np.ndarray):
+			raise TypeError("Error: val has to be given as numpy array!")
+		if not isinstance(lon,np.ndarray) or not isinstance(lat,np.ndarray):
+			if any([key is None for key in required_keywords]):
+				raise TypeError("Error: Either lon and lat have to be given as numpy "
+					            "arrays or the grid has to be specificed by Nlon, Nlat, "
+					            "lon0, lat0, dlon, dlat, and fast_index!")
+		elif not same_shape(lon, lat) or not same_shape(lon,val):
 			raise TypeError("Error: lon, lat, and val have to be given in "
 			                "same shape!")
-		self._lon = lon
-		self._lat = lat
+		#self._lon = lon
+		#self._lat = lat
 		self._val = val
 		self._filename = filename
 		self._remove_file = False
 		self._has_grid = False
-		self._rect = rect
+		try:
+			self._rect = [rect.lon_bounds()[0], rect.lon_bounds()[1],
+			              rect.lat_bounds()[0], rect.lat_bounds()[1]]
+		except:
+			print("rect:",rect)
+			self._rect = rect.copy()
 		self._registration = registration
 		if registration not in ['gridline','pixel']:
 			raise ValueError("Unknown registration '" + str(registration) + "'. "
 			                 "Must be either 'gridline' or 'pixel'.")
-		if not _no_grid_check or fast_index is None or Nlon is None or \
-		    Nlat is None:
+		
+		if not _no_grid_check or any([key is None for key in required_keywords]):
 		   grid_property = _is_gridded(lon, lat)
 		   fast_index = grid_property["fast_index"]
 		   Nlon = grid_property["Nlon"]
 		   Nlat = grid_property["Nlat"]
+		   lon0 = grid_property["lon0"]
+		   lat0 = grid_property["lat0"]
+		   dlon = grid_property["dlon"]
+		   dlat = grid_property["dlat"]
 		   if not grid_property["is_gridded"] and \
 		       not (np.issorted(lon) and np.issorted(lat)):
 		       # Q&D
 		       raise ValueError("For non-gridded data, lon and lat "
 		                        "have to be sorted!")
 		
+		# So far restrict to regular 2d grids.
+		# Then we only need the lon and lat anchor, the step width and the
+		# order of lon and lat iteration.
+		self._lon0 = lon0
+		self._lat0 = lat0
+		self._dlon = dlon
+		self._dlat = dlat
 		
 		self._fast_index = fast_index
 		self._Nlon = Nlon
 		self._Nlat = Nlat
+		
+		# TODO: Ensure pixel registration!
+		
+		# TODO: Ensure longitude fast index!
+		self._2dview = self._val.view()
+		self._2dview.shape = (Nlat,Nlon)
+	
+	def __getitem__(self, key):
+		"""
+		The item grid[i,j] returns the value at lon[i], lat[j]
+		"""
+		# Ensure key is right:
+		if isinstance(key,slice):
+			return self._val[key]
+		elif isinstance(key,tuple) and len(key) == 2 or \
+		     isinstance(key,list) and len(key) == 2:
+			return self._2dview[key[1],key[0]]
+		
+		# Otherwise we do not have a valid key:
+		raise TypeError("Need valid array index to access Grid item!")
 	
 	def __del__(self):
 		if hasattr(self,'_remove_file') and self._remove_file:
 			remove(self._filename)
-		
+	
+	
+	def rect(self):
+		return np.array([self._rect[0],self._rect[1],self._rect[2],self._rect[3]])
 	
 	def _create_grd_file(self):
 		
-		# Step 1: Create temporary csv:
-		if not _is_gridded(self._lon, self._lat)["is_gridded"]:
-			lon, lat = np.meshgrid(self._lon, self._lat,
-			                       indexing='ij')
-			dlon = self._lon[1]-self._lon[0]
-			dlat = self._lat[1]-self._lat[0]
-		else:
-			lon, lat = self._lon, self._lat
-			lon_unq = np.sort(np.unique(lon))
-			lat_unq = np.sort(np.unique(lat))
-			dlon = lon_unq[1]-lon_unq[0]
-			dlat = lat_unq[1]-lat_unq[0]
+#		# Step 1: Create temporary csv:
+#		if not _is_gridded(self._lon, self._lat)["is_gridded"]:
+#			lon, lat = np.meshgrid(self._lon, self._lat,
+#			                       indexing='ij')
+#			dlon = self._lon[1]-self._lon[0]
+#			dlat = self._lat[1]-self._lat[0]
+#		else:
+#			lon, lat = self._lon, self._lat
+#			lon_unq = np.sort(np.unique(lon))
+#			lat_unq = np.sort(np.unique(lat))
+#			dlon = lon_unq[1]-lon_unq[0]
+#			dlat = lat_unq[1]-lat_unq[0]
 		
 		csv_path = None
 		try:
@@ -375,9 +545,12 @@ class Grid:
 				
 				# Create the argument string:
 				# -F : Pixel registration.
-				args = "%s -G%s -ZBL -I%.5f/%.5f -V -R" \
-					   % (fcsv.name, self._filename, dlon, dlat) \
-					   +str(self._rect)
+				args = "%s -G%s -ZBL -I%.5f/%.5f -V -R%f/%f/%f/%f" \
+					   % (fcsv.name, self._filename, self._dlon, self._dlat,
+					      self._rect[0], self._rect[1], self._rect[2],
+					      self._rect[3])
+#					   % (fcsv.name, self._filename, self._dlon, self._dlat) \
+#					   +str(self._rect)
 				if nanvalue is not None:
 					# Write NaN values to a value outside range:
 					args += " -di%i" % (nanvalue)
