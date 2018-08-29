@@ -102,7 +102,7 @@ class MPLWrapperColormap(Colormap):
 			changes = np.sort(np.array(list(changes)))[1:]
 			
 			colors = []
-			colors += [[0, segs[0][0,0], segs[1][0,0], segs[2][0,0]]]
+			colors += [[0, segs[0][0,1], segs[1][0,1], segs[2][0,1]]]
 			for x in changes:
 				c0 = [0,0,0]
 				c1 = [0,0,0]
