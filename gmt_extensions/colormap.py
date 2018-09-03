@@ -69,14 +69,19 @@ class MPLWrapperColormap(Colormap):
 	from them.
 	"""
 	def __init__(self, cmap, vmin=0, vmax=1):
-		Colormap.__init__(self,cmap,vmin,vmax)
 		if not has_mpl:
 			raise ImportError("Could not import all matplotlib dependencies!")
 		
 		if isinstance(cmap,str):
+			Colormap.__init__(self,cmap,vmin,vmax)
 			cmap = mpl_get_cmap(cmap)
-		elif not isinstance(cmap,Colormap):
-			raise ValueError("The argument 'cmap' is of wrong type!")
+		else:
+			try:
+				name = str(cmap.name)
+			except:
+				raise ValueError("The argument 'cmap' is of wrong type!")
+			
+			Colormap.__init__(self,name,vmin,vmax)
 		
 		# Obtain table to convert to .cpt:
 		if 'colors' in cmap.__dict__.keys():
